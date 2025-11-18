@@ -5,6 +5,8 @@ import sqlite3
 from geopy.distance import geodesic
 from datetime import datetime, timedelta
 import threading
+import requests
+import time
 
 # Logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -82,7 +84,7 @@ def try_next_driver(order_id, last_driver_id):
         # Endi boshqa haydovchilarga yuborish
         c.execute("SELECT user_id, start_lat, start_lon, end_lat, end_lon FROM orders WHERE id = ?", (order_id,))
         order_data = c.fetchone()
-        if order_
+        if order_data:
             user_id, start_lat, start_lon, end_lat, end_lon = order_data
             # Eng yaqin haydovchini qidirish
             c.execute("SELECT chat_id FROM drivers WHERE status = 'available' AND chat_id != ? ORDER BY ABS(location_lat - ?) + ABS(location_lon - ?) LIMIT 1",
@@ -145,7 +147,10 @@ def at_customer(update, context):
         user_id = order[0]
         context.bot.send_message(
             chat_id=user_id,
-            text="🚕 Taxi sizni kutmoqda. Iltimos, chiqing."
+            text="🚕 Taxi sizni kutmoqda. Iltimos, chiqing.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Bekor qilish", callback_data=f"cancel_after_driver_arrives_{order[0]}")]
+            ])
         )
 
     update.message.reply_text(
@@ -153,6 +158,40 @@ def at_customer(update, context):
         reply_markup=ReplyKeyboardRemove()
     )
     return END_TRIP
+
+def cancel_after_driver_arrives(update, context):
+    query = update.callback_query
+    query.answer()
+    order_id = int(query.data.split("_")[-1])
+    user_id = query.from_user.id
+
+    conn = sqlite3.connect('taxi.db')
+    c = conn.cursor()
+
+    # Bonus hisobini olish
+    c.execute("SELECT bonus FROM user_bonus WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    current_bonus = row[0] if row else 0
+
+    # -1000 so'm bonusni yechish
+    new_bonus = current_bonus - 1000
+    c.execute("UPDATE user_bonus SET bonus = ? WHERE user_id = ?", (new_bonus, user_id))
+
+    # Buyurtma bekor qilindi
+    c.execute("UPDATE orders SET status = 'cancelled_by_user_after_driver_arrived' WHERE id = ? AND user_id = ?", (order_id, user_id))
+
+    # Haydovchini topish
+    c.execute("SELECT driver_id FROM orders WHERE id = ?", (order_id,))
+    driver = c.fetchone()
+    if driver:
+        driver_id = driver[0]
+        # Haydovchi hisobiga 1000 so'm qo'shish
+        c.execute("UPDATE drivers SET balance = balance + 1000 WHERE chat_id = ?", (driver_id,))
+
+    conn.commit()
+    conn.close()
+
+    query.edit_message_text("❌ Buyurtma bekor qilindingiz. Bonus hisobingizdan 1000 so'm yechildi.")
 
 def get_end_location(update, context):
     location = update.message.location
@@ -390,7 +429,23 @@ def get_driver_balance(driver_id):
     conn.close()
     return balance[0] if balance else 0
 
+def keep_alive():
+    while True:
+        try:
+            # O'z serveringizni URL bilan almashtiring
+            response = requests.get("https://asataxi.fly.dev")
+            print(f"Serverga so'rov yuborildi: {response.status_code}")
+        except Exception as e:
+            print(f"Xatolik: {e}")
+        time.sleep(30)  # 30 soniyada bir so'rov
+
+def start_keep_alive():
+    thread = threading.Thread(target=keep_alive)
+    thread.daemon = True
+    thread.start()
+
 def main():
+    start_keep_alive()  # Uyquga ketmaslik funksiyasini chaqirish
     init_db()
     updater = Updater("8535388426:AAHkRRbqnHdjZySr5qYPz944u49bjSDnlSc", use_context=True)
     dp = updater.dispatcher
@@ -408,6 +463,7 @@ def main():
 
     dp.add_handler(conv_handler)
     dp.add_handler(CallbackQueryHandler(button_callback))
+    dp.add_handler(CallbackQueryHandler(cancel_after_driver_arrives, pattern=r"cancel_after_driver_arrives_\d+"))
     dp.add_handler(MessageHandler(Filters.regex('🟢 Ishni boshlash'), set_online))
     dp.add_handler(MessageHandler(Filters.regex('🔴 Linyadan chiqish'), set_offline))
     dp.add_handler(MessageHandler(Filters.regex('💰 Hisobim'), show_balance))
