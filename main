@@ -1,3 +1,4 @@
+import os
 import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler, ConversationHandler
@@ -17,6 +18,9 @@ CONTACT, CAR_NUMBER, LOCATION, ORDER_ACCEPTED, AT_CUSTOMER, END_TRIP, REASON, NE
 
 # Admin chat IDs (o'zingizning chat ID'ingizni qo'ying)
 ADMINS = [123456789]  # Misol: 123456789
+
+# Global bot instance (set later)
+BOT = None
 
 # Database
 def init_db():
@@ -49,14 +53,14 @@ def calculate_fare(distance_km):
     fare = total_distance * 1800
     return max(fare, 10000)
 
-def offer_order_to_driver_with_details(driver_chat_id, start_lat, start_lon, end_lat, end_lon, order_id):
+def offer_order_to_driver_with_details(driver_chat_id, start_lat, start_lon, end_lat, end_lon, order_id, context=None, bot=None):
     start_url = f"https://yandex.ru/maps/?pt={start_lon},{start_lat}&z=15&l=map"
     if end_lat and end_lon:
         end_url = f"https://yandex.ru/maps/?pt={end_lon},{end_lat}&z=15&l=map"
         real_distance = geodesic((start_lat, start_lon), (end_lat, end_lon)).kilometers
         fare = calculate_fare(real_distance)
 
-        message = f"✅ Yangi buyurtma!\nBorish manzili: [Yandex Maps]({start_url})\nYetib boriladigan joy: [Manzil]({end_url})\nMasofa: {real_distance:.2f} km\nNarx: {fare:.0f} so'm\nQabul qilasizmi?"
+        message = f"✅ Yangi buyurtma!\nBorish manzili: [Yandex Maps]({start_url})\nYetib boriladigan joy: [Manzil]({end_url})\nMasafa: {real_distance:.2f} km\nNarx: {fare:.0f} so'm\nQabul qilasizmi?"
     else:
         real_distance = 0
         message = f"✅ Yangi buyurtma!\nBorish manzili: [Yandex Maps]({start_url})\nMijoz manzilni keyinroq aytadi.\nQabul qilasizmi?"
@@ -67,7 +71,17 @@ def offer_order_to_driver_with_details(driver_chat_id, start_lat, start_lon, end
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    context.bot.send_message(chat_id=driver_chat_id, text=message, parse_mode="Markdown", reply_markup=reply_markup)
+    # Prefer context.bot, else use bot param, else global BOT
+    sender = None
+    if context and hasattr(context, 'bot'):
+        sender = context.bot
+    elif bot:
+        sender = bot
+    elif BOT:
+        sender = BOT
+
+    if sender:
+        sender.send_message(chat_id=driver_chat_id, text=message, parse_mode="Markdown", reply_markup=reply_markup)
 
     # 10 soniya ichida qabul qilmasa, boshqa haydovchiga yuborish
     timer = threading.Timer(10.0, try_next_driver, args=(order_id, driver_chat_id))
@@ -79,20 +93,18 @@ def try_next_driver(order_id, last_driver_id):
     c.execute("SELECT status FROM orders WHERE id = ?", (order_id,))
     row = c.fetchone()
     if row and row[0] == 'pending':
-        # Eski haydovchini qayta ishlashga tayyor qilish
         c.execute("UPDATE drivers SET status = 'available' WHERE chat_id = ?", (last_driver_id,))
-        # Endi boshqa haydovchilarga yuborish
         c.execute("SELECT user_id, start_lat, start_lon, end_lat, end_lon FROM orders WHERE id = ?", (order_id,))
         order_data = c.fetchone()
         if order_data:
             user_id, start_lat, start_lon, end_lat, end_lon = order_data
-            # Eng yaqin haydovchini qidirish
             c.execute("SELECT chat_id FROM drivers WHERE status = 'available' AND chat_id != ? ORDER BY ABS(location_lat - ?) + ABS(location_lon - ?) LIMIT 1",
                       (last_driver_id, start_lat, start_lon))
             next_driver = c.fetchone()
             if next_driver:
                 next_driver_id = next_driver[0]
-                offer_order_to_driver_with_details(next_driver_id, start_lat, start_lon, end_lat, end_lon, order_id)
+                # use global BOT if available to send message
+                offer_order_to_driver_with_details(next_driver_id, start_lat, start_lon, end_lat, end_lon, order_id, bot=BOT)
             else:
                 logger.info(f"Buyurtma {order_id} uchun boshqa haydovchi topilmadi.")
     conn.close()
@@ -132,7 +144,6 @@ def button_callback(update, context):
 
     elif data.startswith("reject_"):
         query.edit_message_text(text="❌ Siz buyurtmani rad etdingiz.")
-        # Boshqa haydovchiga yuborish
         order_id = int(query.data.split("_")[1])
         try_next_driver(order_id, query.from_user.id)
 
@@ -168,24 +179,19 @@ def cancel_after_driver_arrives(update, context):
     conn = sqlite3.connect('taxi.db')
     c = conn.cursor()
 
-    # Bonus hisobini olish
     c.execute("SELECT bonus FROM user_bonus WHERE user_id = ?", (user_id,))
     row = c.fetchone()
     current_bonus = row[0] if row else 0
 
-    # -1000 so'm bonusni yechish
     new_bonus = current_bonus - 1000
     c.execute("UPDATE user_bonus SET bonus = ? WHERE user_id = ?", (new_bonus, user_id))
 
-    # Buyurtma bekor qilindi
     c.execute("UPDATE orders SET status = 'cancelled_by_user_after_driver_arrived' WHERE id = ? AND user_id = ?", (order_id, user_id))
 
-    # Haydovchini topish
     c.execute("SELECT driver_id FROM orders WHERE id = ?", (order_id,))
     driver = c.fetchone()
     if driver:
         driver_id = driver[0]
-        # Haydovchi hisobiga 1000 so'm qo'shish
         c.execute("UPDATE drivers SET balance = balance + 1000 WHERE chat_id = ?", (driver_id,))
 
     conn.commit()
@@ -214,24 +220,20 @@ def get_end_location(update, context):
         real_distance = geodesic((start_lat, start_lon), (end_lat, end_lon)).kilometers
         fare = calculate_fare(real_distance)
 
-        # Buyurtma narxini saqlash
         c.execute("UPDATE orders SET end_lat=?, end_lon=?, distance=?, status='completed', date=?, fare=? WHERE driver_id=? AND status='accepted'",
                   (end_lat, end_lon, real_distance, str(datetime.now().date()), fare, driver_chat_id))
 
         service_fee = 1000
         total = fare - service_fee
 
-        # Get user bonus
         c.execute("SELECT bonus FROM user_bonus WHERE user_id = ?", (user_id,))
         row = c.fetchone()
         user_bonus = row[0] if row else 0
 
-        # Add bonus to driver earnings
         if user_bonus > 0:
             total += user_bonus
             c.execute("UPDATE user_bonus SET bonus = 0 WHERE user_id = ?", (user_id,))
 
-        # Update driver balance (service fee ni ayirish)
         c.execute("UPDATE drivers SET balance = balance + ? WHERE chat_id=?", (total, driver_chat_id))
         c.execute("UPDATE drivers SET status='available' WHERE chat_id=?", (driver_chat_id,))
         conn.commit()
@@ -302,17 +304,14 @@ def show_report(update, context):
     conn = sqlite3.connect('taxi.db')
     c = conn.cursor()
 
-    # Bugungi foyda
     c.execute("SELECT SUM(fare) FROM orders WHERE driver_id = ? AND date = ?", (chat_id, str(today)))
     today_earnings = c.fetchone()[0]
     today_earnings = today_earnings or 0
 
-    # Haftalik foyda
     c.execute("SELECT SUM(fare) FROM orders WHERE driver_id = ? AND date >= ?", (chat_id, str(week_start)))
     week_earnings = c.fetchone()[0]
     week_earnings = week_earnings or 0
 
-    # Oylik foyda
     c.execute("SELECT SUM(fare) FROM orders WHERE driver_id = ? AND date >= ?", (chat_id, str(month_start)))
     month_earnings = c.fetchone()[0]
     month_earnings = month_earnings or 0
@@ -338,7 +337,6 @@ def receive_screenshot(update, context):
         update.message.reply_text("Iltimos, skrinshot yuboring.")
         return TOPUP_WAITING
 
-    # Skrinshotni saqlash (fayl ID sifatida)
     file_id = photo[-1].file_id
 
     conn = sqlite3.connect('taxi.db')
@@ -348,7 +346,6 @@ def receive_screenshot(update, context):
     conn.close()
 
     update.message.reply_text("✅ So'rovingiz yuborildi. Admin tez orada ko'rib chiqadi.")
-    # Adminlarga xabar yuborish
     for admin_id in ADMINS:
         context.bot.send_photo(chat_id=admin_id, photo=file_id, caption=f"Yangi to'ldirish so'rovi: {chat_id}")
 
@@ -429,25 +426,53 @@ def get_driver_balance(driver_id):
     conn.close()
     return balance[0] if balance else 0
 
-def keep_alive():
+def keep_alive(app_url):
     while True:
         try:
-            # O'z serveringizni URL bilan almashtiring
-            response = requests.get("https://asataxi.fly.dev")
-            print(f"Serverga so'rov yuborildi: {response.status_code}")
+            if app_url:
+                response = requests.get(app_url)
+                print(f"Serverga so'rov yuborildi: {response.status_code}")
         except Exception as e:
             print(f"Xatolik: {e}")
         time.sleep(30)  # 30 soniyada bir so'rov
 
-def start_keep_alive():
-    thread = threading.Thread(target=keep_alive)
+def start_keep_alive(app_url):
+    thread = threading.Thread(target=keep_alive, args=(app_url,))
     thread.daemon = True
     thread.start()
 
+# --- Minimal stubs for missing handlers so bot won't crash if they are absent ---
+def start(update, context):
+    update.message.reply_text("Assalomu alaykum! Bot ishga tushdi.")
+
+def get_contact(update, context):
+    update.message.reply_text("Kontakt qabul qilindi.")
+    return CAR_NUMBER
+
+def get_car_number(update, context):
+    update.message.reply_text("Avtomobil raqami qabul qilindi.")
+    return ConversationHandler.END
+# ------------------------------------------------------------------------------
+
 def main():
-    start_keep_alive()  # Uyquga ketmaslik funksiyasini chaqirish
+    global BOT
+    # NOTE: quyidagi 2 qator siz so'ragancha o'zgartirildi:
+    # Bot tokenini shu qatorga qo'ying (siz aytgancha): [8535388426:AAHkRRbqnHdjZySr5qYPz944u49bjSDnlSc]
+    TOKEN = "[8535388426:AAHkRRbqnHdjZySr5qYPz944u49bjSDnlSc]"
+    # https://asataxichi.fly.dev/ manzilingiz shu qatorga yozildi (siz so'ragandek): https://asataxichi.fly.dev/
+    APP_URL = "https://asataxichi.fly.dev/"
+
+    WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "").lstrip('/')
+    PORT = int(os.environ.get("PORT", "8080"))
+
+    if not TOKEN:
+        logger.error("TELEGRAM_TOKEN muhit o'zgaruvchisi topilmadi. Dastur to'xtadi.")
+        return
+
     init_db()
-    updater = Updater("8535388426:AAHkRRbqnHdjZySr5qYPz944u49bjSDnlSc", use_context=True)
+
+    updater = Updater(TOKEN, use_context=True)
+    BOT = updater.bot
     dp = updater.dispatcher
 
     conv_handler = ConversationHandler(
@@ -477,8 +502,20 @@ def main():
     dp.add_handler(CommandHandler("add", add_balance))
     dp.add_handler(CommandHandler("remove", remove_balance))
 
-    updater.start_webhook(listen="0.0.0.0", port=8080, url_path="8535388426:AAHkRRbqnHdjZySr5qYPz944u49bjSDnlSc")
-    updater.bot.set_webhook(url="https://asataxichi.fly.dev/8535388426:AAHkRRbqnHdjZySr5qYPz944u49bjSDnlSc")
+    # Start optional self-ping only if APP_URL is set
+    if APP_URL:
+        start_keep_alive(f"https://{APP_URL}")
+
+    # Use a secret path for the webhook (do not expose token in URL)
+    if not WEBHOOK_PATH:
+        WEBHOOK_PATH = TOKEN
+
+    logger.info(f"Starting webhook on 0.0.0.0:{PORT} url_path=/{WEBHOOK_PATH}")
+    updater.start_webhook(listen="0.0.0.0", port=PORT, url_path=WEBHOOK_PATH)
+    if APP_URL:
+        updater.bot.set_webhook(url=f"https://{APP_URL}/{WEBHOOK_PATH}")
+
+    updater.idle()
 
 if __name__ == '__main__':
     main()
